@@ -1,0 +1,116 @@
+```text
+Você é um Engenheiro de Software Sênior especialista em Python (Pandas/Streamlit) e SQL. Abaixo está a documentação das lógicas fundamentais implementadas na versão mais recente do "Dashboard de Carteiras". 
+
+O objetivo do sistema é analisar carteiras de investimentos, gerenciar cadastros de Renda Variável de forma inteligente e comparar fundos internos com a concorrência.
+
+Por favor, analise a lógica abaixo para me ajudar a implementar essas mesmas estruturas na minha versão legada do sistema.
+
+---
+
+### 1. Lógica de Enriquecimento Automático (Biblioteca de Renda Variável)
+Criamos um mecanismo que age como uma "memória" para o cadastro de ativos de Renda Variável (RV). A função `update_rv_library_and_sectors` analisa a base de dados em busca de tickers de RV. Se um ativo tem informações faltando (como setor, emissor ou país), o sistema busca o dado mais recente já visto na história para aquele ticker e preenche a lacuna automaticamente, sem sobrescrever o que já foi preenchido manualmente.
+
+**Trecho de Código (Python):**
+```python
+# A lógica varre a biblioteca para cada campo (ex: 'setor', 'pais')
+for field in RV_LIBRARY_FIELDS:
+    current = refs[field]
+    
+    # 1. Recupera o valor conhecido na biblioteca para cada ticker na base atual
+    fill_values = ticker_key.map(library_lookup[field])
+    
+    # 2. Máscara booleana: Onde aplicar a correção?
+    # - É Renda Variável
+    # - O campo atual está vazio/não classificado
+    # - A biblioteca TEM uma informação válida para preencher
+    apply_mask = (
+        rv_mask
+        & ticker_key.ne("")
+        & current.map(is_unclassified)
+        & ~fill_values.map(is_unclassified)
+    )
+    
+    # 3. Aplica o enriquecimento na base final
+    if apply_mask.any():
+        result.loc[apply_mask, field] = fill_values[apply_mask]
+```
+
+---
+
+### 2. Arquitetura Modular do Motor Analítico (SQL com CTEs)
+Em vez de consultas monolíticas complexas, o cálculo do Raio-X foi refatorado em 9 etapas usando CTEs (Common Table Expressions). Isso permite que o banco de dados processe todas as agregações (Instrumentos, Setores, Ratings) de uma só vez, e o Python apenas escolha qual CTE final quer consumir (`SELECT * FROM {CTE}`).
+
+**Trecho da Query (SQL):**
+```sql
+-- ETAPA 2: Consolidação da Carteira base
+WITH Carteira AS (
+    SELECT C.*, T.perc_pl
+    FROM carteira_mock_concorrente C
+    INNER JOIN tratamento_api_comdinheiro T ON T.isin = C.isin
+    WHERE C.codigo_IAM_fundo IN ('MOCK_FUNDO_PRINCIPAL', 'EXT_00000000000191')
+),
+
+-- ETAPA 3: Cálculo de Métricas Globais (Visão Geral)
+VisaoGeral AS (
+    SELECT
+        codigo_IAM_fundo AS fundo,
+        COUNT(DISTINCT codigo_IAM_ativo) AS qtd_ativos,
+        SUM(ISNULL(perc_pl, 0)) AS pl_total,
+        -- Duration Ponderada: (Soma de PL * Duration) / PL Total
+        SUM(ISNULL(perc_pl, 0) * ISNULL(duration, 0)) / NULLIF(SUM(ISNULL(perc_pl, 0)), 0) AS duration_fundo
+    FROM Carteira
+    GROUP BY codigo_IAM_fundo
+)
+-- O Python altera a última linha dependendo do gráfico que quer renderizar
+SELECT * FROM VisaoGeral; 
+```
+
+---
+
+### 3. Lógica de Comparação Concorrencial (Delta e Overlap)
+Para a análise de "Raio-X", o sistema cruza o fundo da casa (`MOCK_FUNDO_PRINCIPAL`) com fundos da concorrência (`EXT_...`). Criamos lógicas matemáticas direto no SQL para calcular o **Delta** (diferença de alocação em um instrumento) e o **Overlap** (ativos ou grupos econômicos que ambos os fundos possuem em comum).
+
+**Trecho da Query (SQL):**
+```sql
+-- Lógica de OVERLAP: Intersecção de Grupos Econômicos
+OverlapGrupos AS (
+    SELECT
+        emissor,
+        SUM(CASE WHEN codigo_IAM_fundo = 'MOCK_FUNDO_PRINCIPAL' THEN ISNULL(perc_pl, 0) ELSE 0 END) AS perc_fundo1,
+        SUM(CASE WHEN codigo_IAM_fundo = 'EXT_00000000000191' THEN ISNULL(perc_pl, 0) ELSE 0 END) AS perc_fundo2
+    FROM Carteira
+    GROUP BY emissor
+    -- O 'HAVING' garante que só retornamos emissores que existem em AMBOS os fundos (> 0)
+    HAVING SUM(CASE WHEN codigo_IAM_fundo = 'MOCK_FUNDO_PRINCIPAL' THEN ISNULL(perc_pl, 0) ELSE 0 END) > 0
+       AND SUM(CASE WHEN codigo_IAM_fundo = 'EXT_00000000000191' THEN ISNULL(perc_pl, 0) ELSE 0 END) > 0
+)
+```
+
+---
+
+### 4. Gestão Dinâmica de Cadastros e Nomenclaturas
+Para evitar *hardcoding* no código-fonte, a lógica nova separa nomes de fundos internos e externos em estruturas descentralizadas. Os fundos internos permitem *override* via um arquivo `fund_names.json`, enquanto os fundos de mercado são processados limpando os CNPJs.
+
+**Trecho de Código (Python):**
+```python
+# Lógica de fallback para nomeclatura de fundos
+def get_fund_name(fund_code):
+    code = str(fund_code).strip()
+    # 1º tenta buscar no JSON customizável do usuário
+    # 2º tenta no dicionário fixo (FUND_NAME_MAP)
+    # 3º faz o fallback para o próprio código se não existir
+    return CUSTOM_FUND_NAME_MAP.get(code, FUND_NAME_MAP.get(code, code))
+
+# Lógica de padronização de chaves externas para match exato
+def load_market_funds(path, modified_time):
+    # ...
+    # O CNPJ é normalizado (removendo pontos, traços, etc)
+    market["cnpj_normalizado"] = market["cnpj"].map(normalize_cnpj)
+    # E transformado em uma chave única (ex: EXT_00000000000191) para bater com o banco de dados
+    market["external_key"] = "EXT_" + market["cnpj_normalizado"]
+    # ...
+```
+
+**Tarefa:**
+Com base nas lógicas e códigos acima, atue como meu pair programmer. Eu irei fornecer trechos do meu código legado, e você deverá reescrevê-los aplicando estritamente as novas lógicas de CTEs no SQL e os mecanismos de enriquecimento e mapeamento do Pandas demonstrados aqui.
+```
